@@ -714,6 +714,26 @@ public class BBMetalCamera: NSObject {
         }
         lock.signal()
     }
+
+    /// Updates session preset. This will briefly stop and restart the session.
+    public func updateSessionPreset(_ preset: AVCaptureSession.Preset, completion: (() -> Void)? = nil) {
+        lock.wait()
+        session.stopRunning()
+        if multipleSessions, let session = audioSession { session.stopRunning() }
+        session.beginConfiguration()
+        if !(session is AVCaptureMultiCamSession), session.canSetSessionPreset(preset) {
+            session.sessionPreset = preset
+        }
+        session.commitConfiguration()
+        session.startRunning()
+        if multipleSessions, let session = audioSession { session.startRunning() }
+        lock.signal()
+        if let completion {
+            DispatchQueue.main.async {
+                completion()
+            }
+        }
+    }
     
     /// Starts capturing
     public func start() {
