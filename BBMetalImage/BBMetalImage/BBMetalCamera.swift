@@ -599,6 +599,71 @@ public class BBMetalCamera: NSObject {
         }
         lock.signal()
     }
+
+    /// Switches camera position (back to front, or front to back)
+    ///
+    /// - Returns: true if succeed, or false if fail
+    @discardableResult
+    public func switchCameraPosition2() -> Bool {
+        lock.wait()
+        session.beginConfiguration()
+        defer {
+            session.commitConfiguration()
+            lock.signal()
+        }
+        
+        var position: AVCaptureDevice.Position = .back
+        if camera.position == .back { position = .front }
+        
+        var tempDevice: AVCaptureDevice?
+        if position == .back {
+            if !_canGetDepthData, #available(iOS 13.0, *) {
+                tempDevice = AVCaptureDevice.default(.builtInUltraWideCamera, for: .video, position: position)
+            }
+            if tempDevice == nil, #available(iOS 13.0, *) {
+                tempDevice = AVCaptureDevice.default(.builtInDualWideCamera, for: .video, position: position)
+            }
+            if tempDevice == nil, #available(iOS 10.2, *) {
+                tempDevice = AVCaptureDevice.default(.builtInDualCamera, for: .video, position: position)
+            }
+            if tempDevice == nil {
+                tempDevice = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position)
+            }
+        } else {
+            if _canGetDepthData, #available(iOS 11.1, *) {
+                tempDevice = AVCaptureDevice.default(.builtInTrueDepthCamera, for: .video, position: position)
+            }
+            if tempDevice == nil {
+                tempDevice = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position)
+            }
+        }
+        
+        guard let videoDevice = tempDevice,
+            let videoDeviceInput = try? AVCaptureDeviceInput(device: videoDevice) else { return false }
+        
+        session.removeInput(videoInput)
+        
+        guard session.canAddInput(videoDeviceInput) else {
+            session.addInput(videoInput)
+            return false
+        }
+        session.addInput(videoDeviceInput)
+        camera = videoDevice
+        videoInput = videoDeviceInput
+        
+        guard let connection = videoOutput.connections.first,
+            connection.isVideoOrientationSupported else { return false }
+        originalOrientation = connection.videoOrientation
+        connection.videoOrientation = .portrait
+        
+        if _canGetDepthData,
+           #available(iOS 11.0, *) {
+            _removeDepthDataOutput()
+            if !_addDepthDataOutput() { return false }
+        }
+        
+        return true
+    }
     
     /// Switches camera position (back to front, or front to back)
     ///
