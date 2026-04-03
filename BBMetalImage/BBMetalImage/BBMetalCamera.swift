@@ -8,6 +8,17 @@
 
 import AVFoundation
 
+public enum BBVideoFormat: String, CaseIterable, Identifiable {
+    case sdr = "SDR"
+    case hdr = "HDR"
+    case log = "LOG"
+
+    public var id: String { rawValue }
+
+    public var title: String { rawValue }
+}
+
+
 /// Camera photo delegate defines handling taking photo result behaviors
 public protocol BBMetalCameraPhotoDelegate: AnyObject {
     /// Called when camera did take a photo and get Metal texture
@@ -762,6 +773,224 @@ public class BBMetalCamera: NSObject {
         }
         lock.signal()
         return success
+    }
+
+    /// Sets camera frame rate without locking. Caller must ensure device is locked.
+    ///
+    /// - Parameters:
+    ///   - frameRate: camera frame rate
+    ///   - device: locked camera device
+    /// - Returns: true if succeed, or false if fail
+    @discardableResult
+    public func setFrameRate(_ frameRate: Float64, on device: AVCaptureDevice) -> Bool {
+        var targetFormat: AVCaptureDevice.Format?
+        let dimensions = CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription)
+        for format in device.formats {
+            let newDimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+            if dimensions.width == newDimensions.width,
+               dimensions.height == newDimensions.height {
+                for range in format.videoSupportedFrameRateRanges {
+                    if range.maxFrameRate >= frameRate,
+                       range.minFrameRate <= frameRate {
+                        targetFormat = format
+                        break
+                    }
+                }
+                if targetFormat != nil { break }
+            }
+        }
+        if let format = targetFormat {
+            device.activeFormat = format
+            device.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: CMTimeScale(frameRate))
+            device.activeVideoMinFrameDuration = CMTime(value: 1, timescale: CMTimeScale(frameRate))
+            return true
+        }
+        print("Can not find valid format for camera frame rate \(frameRate)")
+        return false
+    }
+    
+    @discardableResult
+    public func configureCamera(_ device: AVCaptureDevice, frameRate: Float64, mode: BBVideoFormat) -> Bool {
+        // 1. TÌM TARGET FORMAT & DURATION
+        var targetFormat = device.activeFormat
+        let targetDuration = CMTime(value: 1, timescale: CMTimeScale(frameRate))
+        
+        // Kiểm tra xem format hiện tại đã support frameRate yêu cầu chưa
+        let currentSupportsFR = targetFormat.videoSupportedFrameRateRanges.contains {
+            $0.maxFrameRate >= frameRate && $0.minFrameRate <= frameRate
+        }
+        
+        // Nếu chưa support, tìm format mới có cùng kích thước (dimensions) và hỗ trợ frameRate
+        if !currentSupportsFR {
+            let currentDimensions = CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription)
+            
+            if let newFormat = device.formats.first(where: { format in
+                let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+                guard dims.width == currentDimensions.width, dims.height == currentDimensions.height else { return false }
+                return format.videoSupportedFrameRateRanges.contains {
+                    $0.maxFrameRate >= frameRate && $0.minFrameRate <= frameRate
+                }
+            }) {
+                targetFormat = newFormat
+            } else {
+                print("Can not find valid format for camera frame rate \(frameRate)")
+                return false
+            }
+        }
+        
+        // 2. TÌM TARGET COLOR SPACE & HDR MODE
+        var preferredColorSpaces: [AVCaptureColorSpace] = []
+        var targetIsVideoHDREnabled: Bool? = nil // Dùng Optional để biết có cần thay đổi HDR hay không
+        
+        switch mode {
+        case .sdr:
+            targetIsVideoHDREnabled = false
+            preferredColorSpaces = [.sRGB, .P3_D65]
+        case .hdr:
+            targetIsVideoHDREnabled = true
+            preferredColorSpaces = [.HLG_BT2020, .P3_D65]
+        case .log:
+            // Ở code cũ của bạn, log không thay đổi isVideoHDREnabled nên mình để là nil
+            if #available(iOS 26.0, *) {
+                preferredColorSpaces = [.appleLog2, .HLG_BT2020, .P3_D65]
+            } else {
+                preferredColorSpaces = [.HLG_BT2020, .P3_D65]
+            }
+        }
+        
+        var targetColorSpace = device.activeColorSpace
+        if #available(iOS 13.0, *) {
+            // Lưu ý: Phải lấy supportedColorSpaces từ targetFormat (format sắp được set)
+            let supportedSpaces = targetFormat.supportedColorSpaces
+            if let bestSpace = preferredColorSpaces.first(where: { supportedSpaces.contains($0) }) {
+                targetColorSpace = bestSpace
+            }
+        }
+        
+        // 3. SO SÁNH VỚI TRẠNG THÁI HIỆN TẠI (Nếu đang set rồi thì không set nữa)
+        let needsFormatUpdate = device.activeFormat != targetFormat
+        let needsFrameRateUpdate = device.activeVideoMinFrameDuration != targetDuration || device.activeVideoMaxFrameDuration != targetDuration
+        let needsColorSpaceUpdate = device.activeColorSpace != targetColorSpace
+        
+        var needsAutoHDRUpdate = false
+        if #available(iOS 13.0, *) {
+            needsAutoHDRUpdate = device.automaticallyAdjustsVideoHDREnabled != false
+        }
+        
+        var needsHDRUpdate = false
+        if let hdrEnabled = targetIsVideoHDREnabled, targetFormat.isVideoHDRSupported {
+            needsHDRUpdate = device.isVideoHDREnabled != hdrEnabled
+        }
+        
+        // TRẢ VỀ NGAY nếu tất cả thông số đã đúng như mong muốn
+        if !needsFormatUpdate && !needsFrameRateUpdate && !needsColorSpaceUpdate && !needsAutoHDRUpdate && !needsHDRUpdate {
+            return true
+        }
+        
+        // 4. ÁP DỤNG CÁC THAY ĐỔI
+        do {
+            try device.lockForConfiguration()
+            
+            // Phải set format đầu tiên trước khi set các thông số khác
+            if needsFormatUpdate {
+                device.activeFormat = targetFormat
+            }
+            
+            if needsFrameRateUpdate {
+                device.activeVideoMinFrameDuration = targetDuration
+                device.activeVideoMaxFrameDuration = targetDuration
+            }
+            
+            if needsAutoHDRUpdate {
+                if #available(iOS 13.0, *) {
+                    device.automaticallyAdjustsVideoHDREnabled = false
+                }
+            }
+            
+            if needsHDRUpdate, let hdrEnabled = targetIsVideoHDREnabled {
+                device.isVideoHDREnabled = hdrEnabled
+            }
+            
+            if needsColorSpaceUpdate {
+                device.activeColorSpace = targetColorSpace
+            }
+            
+            device.unlockForConfiguration()
+            return true
+            
+        } catch {
+            print("Failed to lock device for configuration: \(error)")
+            return false
+        }
+    }
+    
+    public func applyVideoFormat(_ mode: BBVideoFormat) {
+        lock.wait()
+        do {
+            try camera.lockForConfiguration()
+            if #available(iOS 13.0, *) {
+                camera.automaticallyAdjustsVideoHDREnabled = false
+            }
+            
+            let supportedColorSpaces: [AVCaptureColorSpace]
+            let canSetColorSpace: Bool
+            if #available(iOS 13.0, *) {
+                supportedColorSpaces = camera.activeFormat.supportedColorSpaces
+                canSetColorSpace = true
+            } else {
+                supportedColorSpaces = []
+                canSetColorSpace = false
+            }
+            
+            func setPreferredColorSpace(_ spaces: [AVCaptureColorSpace]) {
+                guard canSetColorSpace else { return }
+                for space in spaces where supportedColorSpaces.contains(space) {
+                    camera.activeColorSpace = space
+                    break
+                }
+            }
+            
+            switch mode {
+            case .sdr:
+                if camera.activeFormat.isVideoHDRSupported {
+                    camera.isVideoHDREnabled = false
+                }
+                setPreferredColorSpace([.sRGB, .P3_D65])
+            case .hdr:
+                if camera.activeFormat.isVideoHDRSupported {
+                    camera.isVideoHDREnabled = true
+                }
+                setPreferredColorSpace([.HLG_BT2020, .P3_D65])
+            case .log:
+                if #available(iOS 26.0, *) {
+                    setPreferredColorSpace([.appleLog2, .HLG_BT2020, .P3_D65])
+                } else {
+                    setPreferredColorSpace([.HLG_BT2020, .P3_D65])
+                }
+            }
+            camera.unlockForConfiguration()
+        } catch {
+            print("Error for camera lockForConfiguration: \(error)")
+        }
+        lock.signal()
+    }
+    
+    /// Configures camera and sets frame rate within a single lock.
+    ///
+    /// - Parameters:
+    ///   - frameRate: camera frame rate
+    ///   - block: closure configuring camera
+    public func configureCamera(frameRate: Float64, _ block: (AVCaptureDevice) -> Void) {
+        lock.wait()
+        do {
+            try camera.lockForConfiguration()
+            block(camera)
+            _ = setFrameRate(frameRate, on: camera)
+            camera.unlockForConfiguration()
+        } catch {
+            print("Error for camera lockForConfiguration: \(error)")
+        }
+        lock.signal()
     }
     
     /// Configures camera.
