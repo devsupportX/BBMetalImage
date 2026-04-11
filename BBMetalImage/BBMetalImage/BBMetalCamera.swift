@@ -386,6 +386,8 @@ public class BBMetalCamera: NSObject {
         originalOrientation = connection.videoOrientation
         connection.videoOrientation = .portrait
         
+        session.automaticallyConfiguresApplicationAudioSession = false // cho phép rung và âm thanh khi đang mở camera
+        
         session.commitConfiguration()
         
         #if !targetEnvironment(simulator)
